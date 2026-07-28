@@ -1,0 +1,47 @@
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "Sistema multi-mercado (cripto + renta variable) con IA y motor de riesgo determinista"
+requires-python = ">=3.11"
+dependencies = [
+    # Persistencia
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+    # Configuración y validación
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    # Conectividad
+    "httpx>=0.27",
+    "websockets>=12.0",
+    # Datos / features técnicos
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "ta>=0.11",              # indicadores técnicos en Python puro (alternativa a ta-lib, sin dependencias binarias)
+    # IA / ML (se añaden cuando arranquemos la capa de inteligencia)
+    "xgboost>=2.0",
+    # Utilidades
+    "python-dotenv>=1.0",
+    "tenacity>=8.2",         # reintentos para conectores
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
