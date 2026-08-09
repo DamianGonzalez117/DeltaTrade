@@ -39,6 +39,9 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.mypy]
+ignore_missing_imports = true
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
