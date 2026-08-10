@@ -11,6 +11,7 @@ Bitso API v3 authentication:
 import hashlib
 import hmac
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -73,9 +74,11 @@ class TestBitsoAuthSignatureCorrectness:
 
 class TestBitsoAuthMethodCaseInsensitivity:
     def test_method_uppercased_in_signature(self, api_key, api_secret):
+        fixed_nonce = "1700000000000"
         auth = BitsoAuth(api_key, api_secret)
-        headers_lower = auth.build_headers("post", "/v3/orders/", "{}")
-        headers_upper = auth.build_headers("POST", "/v3/orders/", "{}")
+        with patch("trading_system.connectors.bitso.auth.time.time", return_value=1700000000.0):
+            headers_lower = auth.build_headers("post", "/v3/orders/", "{}")
+            headers_upper = auth.build_headers("POST", "/v3/orders/", "{}")
         assert headers_lower["X-Request-Signature"] == headers_upper["X-Request-Signature"]
 
 
