@@ -27,6 +27,7 @@ from trading_system.db.models import Asset, AISignal, RiskEvaluation, Order
 @pytest.fixture(scope="module")
 def db_session():
     engine = create_engine(settings.database_url, future=True)
+    Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, future=True)
     session = SessionLocal()

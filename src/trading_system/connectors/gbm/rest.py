@@ -20,6 +20,7 @@ import structlog
 from trading_system.connectors.base import Balance, ExecutionResult
 from trading_system.connectors.gbm.auth import GBMAuth
 from trading_system.core.enums import OrderSide, OrderType
+from trading_system.core.retry import retry_async
 
 logger = structlog.get_logger(__name__)
 
@@ -82,6 +83,15 @@ class GBMRESTConnector:
         body_str = json.dumps(body) if body else ""
         if body_str:
             headers["Content-Type"] = "application/json"
+        return await retry_async(self._do_request, method, path, body_str, headers)
+
+    async def _do_request(
+        self,
+        method: str,
+        path: str,
+        body_str: str,
+        headers: dict[str, str],
+    ) -> dict:
         response = await self._client.request(
             method=method,
             url=path,
