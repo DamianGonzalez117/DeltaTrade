@@ -169,6 +169,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_db() -> None:
+    """Verifica que las tablas existan; si no, las crea con Base.metadata."""
+    from sqlalchemy import inspect
+
+    from trading_system.db.base import Base
+    from trading_system.db.models import (  # noqa: F401 (register models)
+        AISignal,
+        Asset,
+        Fill,
+        MarketDataOHLCV,
+        NotificationLog,
+        Order,
+        PortfolioSnapshot,
+        Position,
+        RiskEvaluation,
+        SentimentScore,
+    )
+    from trading_system.db.session import engine
+
+    inspector = inspect(engine)
+    if "assets" not in inspector.get_table_names():
+        logger.info("db.missing_tables", hint="Creando esquema con Base.metadata")
+        Base.metadata.create_all(engine)
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM alembic_version"))
+            conn.execute(text("INSERT INTO alembic_version (version_num) VALUES ('23b72d85a866')"))
+            conn.commit()
+        logger.info("db.schema_created")
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     """Escanea libros de Bitso y notifica señales por Telegram."""
     from trading_system.core.enums import TimeFrame
@@ -181,6 +212,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     from trading_system.services.signal_generator import SignalGenerator
     from trading_system.services.signal_history import SignalHistoryService
 
+    _ensure_db()
     timeframe = TimeFrame(args.timeframe)
 
     notifiers: list = [LogNotifier()]
@@ -227,6 +259,29 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     pos = history_service.get_open_position(book) if history_service else None
                     pos_str = f" [POSITION: qty={pos.quantity}, entry={pos.avg_entry_price}]" if pos else ""
                     print(f"  {book}: {signal.action.value.upper()} (conf={signal.confidence}, rsi={signal.rsi:.1f}){pos_str}")
+            elif args.interactive and history_service is not None:
+                import asyncio as _aio
+
+                from trading_system.services.telegram_bot import TelegramCommandBot
+
+                tg_bot = TelegramCommandBot(
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    history_service=history_service,
+                    dispatcher=dispatcher,
+                    monitor=monitor,
+                )
+
+                scan_task = _aio.create_task(monitor.run())
+                bot_task = _aio.create_task(tg_bot.run())
+
+                try:
+                    await _aio.gather(scan_task, bot_task)
+                except KeyboardInterrupt:
+                    monitor.stop()
+                    tg_bot.stop()
+                    scan_task.cancel()
+                    bot_task.cancel()
             else:
                 await monitor.run()
         finally:
@@ -451,6 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--interval", type=float, default=300.0, help="Segundos entre escaneos")
     scan.add_argument("--min-confidence", type=float, default=0.65, help="Confianza mínima para notificar")
     scan.add_argument("--once", action="store_true", help="Solo un escaneo, sin loop")
+    scan.add_argument("--interactive", action="store_true", help="Bot interactivo de Telegram (responde compré/vendí/posiciones)")
     scan.add_argument("--no-history", action="store_true", help="No persistir señales ni filtrar por posiciones")
     scan.set_defaults(func=cmd_scan)
 

@@ -53,7 +53,10 @@ class BitsoDataIngestor:
             self._client = client
             self._owns_client = False
         else:
-            self._client = httpx.AsyncClient(base_url=base_url)
+            self._client = httpx.AsyncClient(
+                base_url=base_url,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
             self._owns_client = True
 
     async def aclose(self) -> None:
@@ -67,18 +70,23 @@ class BitsoDataIngestor:
         marker: str | None = None,
         sort: str = "desc",
     ) -> list[dict]:
-        """Descarga trades de Bitso (endpoint público, sin auth)."""
-        params: dict[str, str] = {
-            "book": book,
-            "limit": str(limit),
-            "sort": sort,
-        }
-        if marker:
-            params["marker"] = marker
-        response = await self._client.get(_TRADES_PATH, params=params)
-        response.raise_for_status()
-        data = response.json()
-        return data["payload"]
+        """Descarga trades de Bitso (endpoint publico, sin auth)."""
+        from trading_system.core.retry import retry_async
+
+        async def _do_fetch() -> list[dict]:
+            params: dict[str, str] = {
+                "book": book,
+                "limit": str(limit),
+                "sort": sort,
+            }
+            if marker:
+                params["marker"] = marker
+            response = await self._client.get(_TRADES_PATH, params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data["payload"]
+
+        return await retry_async(_do_fetch)
 
     async def fetch_trades_batch(
         self,

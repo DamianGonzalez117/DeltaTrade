@@ -87,6 +87,11 @@ class TestParser:
         args = parser.parse_args(["scan", "--once"])
         assert args.once is True
 
+    def test_scan_interactive_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--interactive"])
+        assert args.interactive is True
+
     def test_confirm_buy_parses_args(self):
         parser = build_parser()
         args = parser.parse_args(["confirm-buy", "--book", "btc_mxn", "--qty", "0.01", "--price", "500000"])

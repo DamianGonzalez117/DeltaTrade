@@ -22,6 +22,7 @@ import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+import httpx
 import structlog
 
 from trading_system.core.enums import NotificationLevel, SignalAction, TimeFrame
@@ -78,7 +79,7 @@ class MarketMonitor:
             try:
                 signal = await self._scan_book(book)
                 results[book] = signal
-            except (ValueError, RuntimeError, ConnectionError, OSError) as exc:
+            except (ValueError, RuntimeError, ConnectionError, OSError, httpx.HTTPError, httpx.TimeoutException) as exc:
                 logger.error("monitor.book_error", book=book, error=str(exc))
                 results[book] = RuleSignal(
                     action=SignalAction.HOLD,
@@ -214,7 +215,10 @@ class MarketMonitor:
         )
 
         while self._running:
-            await self.scan_once()
+            try:
+                await self.scan_once()
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError, RuntimeError, ConnectionError, OSError) as exc:
+                logger.error("monitor.scan_failed", error=str(exc), error_type=type(exc).__name__)
             if self._running:
                 await asyncio.sleep(self._config.interval_seconds)
 
