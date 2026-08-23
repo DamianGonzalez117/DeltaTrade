@@ -74,7 +74,6 @@ class TestBitsoAuthSignatureCorrectness:
 
 class TestBitsoAuthMethodCaseInsensitivity:
     def test_method_uppercased_in_signature(self, api_key, api_secret):
-        fixed_nonce = "1700000000000"
         auth = BitsoAuth(api_key, api_secret)
         with patch("trading_system.connectors.bitso.auth.time.time", return_value=1700000000.0):
             headers_lower = auth.build_headers("post", "/v3/orders/", "{}")

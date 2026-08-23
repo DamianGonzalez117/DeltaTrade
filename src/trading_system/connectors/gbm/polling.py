@@ -16,6 +16,7 @@ import structlog
 
 from trading_system.connectors.base import PollingMarketDataConnector, Ticker
 from trading_system.connectors.gbm.calendar import BMVCalendar
+from trading_system.core.retry import retry_async
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +54,9 @@ class GBMPollingConnector(PollingMarketDataConnector):
         logger.info("gbm_polling.disconnected")
 
     async def get_ticker(self, symbol: str) -> Ticker:
+        return await retry_async(self._fetch_ticker, symbol)
+
+    async def _fetch_ticker(self, symbol: str) -> Ticker:
         response = await self._client.get(f"{_TICKER_PATH}{symbol}")
         response.raise_for_status()
         data = response.json()

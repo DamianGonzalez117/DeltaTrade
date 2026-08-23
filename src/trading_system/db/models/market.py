@@ -4,10 +4,18 @@ Modelos de la Capa de Datos: catálogo de activos y series de precios OHLCV.
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, Boolean, DateTime, Numeric, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from trading_system.core.enums import MarketVenue, AssetClass, TimeFrame
+from trading_system.core.enums import AssetClass, MarketVenue, TimeFrame
 from trading_system.db.base import Base, TimestampMixin
 
 

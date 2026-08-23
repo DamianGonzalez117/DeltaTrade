@@ -6,7 +6,7 @@ poder crearse sin una fila aquí con decision='approved' o 'adjusted'.
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, DateTime, Numeric, ForeignKey, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from trading_system.core.enums import RiskDecision
