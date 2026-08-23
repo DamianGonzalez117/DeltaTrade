@@ -5,7 +5,7 @@ y señales generadas por los modelos cuantitativos/híbridos.
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, DateTime, Numeric, ForeignKey, Text, Index
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 

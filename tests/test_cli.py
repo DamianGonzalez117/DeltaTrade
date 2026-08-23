@@ -65,6 +65,61 @@ class TestParser:
         args = parser.parse_args(["run", "--dry-run"])
         assert args.dry_run is True
 
+    def test_scan_parses_defaults(self):
+        parser = build_parser()
+        args = parser.parse_args(["scan"])
+        assert args.command == "scan"
+        assert args.books == ["btc_mxn", "eth_mxn"]
+        assert args.timeframe == "1h"
+        assert args.trades == 1000
+        assert args.interval == 300.0
+        assert args.min_confidence == 0.65
+        assert args.once is False
+
+    def test_scan_custom_books(self):
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--books", "btc_mxn", "eth_mxn", "sol_mxn"])
+        assert len(args.books) == 3
+        assert "sol_mxn" in args.books
+
+    def test_scan_once_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--once"])
+        assert args.once is True
+
+    def test_confirm_buy_parses_args(self):
+        parser = build_parser()
+        args = parser.parse_args(["confirm-buy", "--book", "btc_mxn", "--qty", "0.01", "--price", "500000"])
+        assert args.command == "confirm-buy"
+        assert args.book == "btc_mxn"
+        assert args.qty == "0.01"
+        assert args.price == "500000"
+
+    def test_close_position_parses_args(self):
+        parser = build_parser()
+        args = parser.parse_args(["close-position", "--book", "btc_mxn", "--price", "510000"])
+        assert args.command == "close-position"
+        assert args.book == "btc_mxn"
+        assert args.price == "510000"
+
+    def test_positions_parses(self):
+        parser = build_parser()
+        args = parser.parse_args(["positions"])
+        assert args.command == "positions"
+
+    def test_history_parses_args(self):
+        parser = build_parser()
+        args = parser.parse_args(["history", "--book", "btc_mxn", "--limit", "10"])
+        assert args.command == "history"
+        assert args.book == "btc_mxn"
+        assert args.limit == 10
+
+    def test_history_defaults(self):
+        parser = build_parser()
+        args = parser.parse_args(["history"])
+        assert args.book is None
+        assert args.limit == 20
+
     def test_requires_command(self):
         parser = build_parser()
         with pytest.raises(SystemExit):

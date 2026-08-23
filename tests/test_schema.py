@@ -8,7 +8,7 @@ Requiere:
     pip install -e ".[dev]"
     pytest
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -17,11 +17,15 @@ from sqlalchemy.orm import sessionmaker
 
 from trading_system.config import settings
 from trading_system.core.enums import (
-    AssetClass, MarketVenue, SignalAction, RiskDecision,
-    OrderSide, OrderType,
+    AssetClass,
+    MarketVenue,
+    OrderSide,
+    OrderType,
+    RiskDecision,
+    SignalAction,
 )
 from trading_system.db.base import Base
-from trading_system.db.models import Asset, AISignal, RiskEvaluation, Order
+from trading_system.db.models import AISignal, Asset, Order, RiskEvaluation
 
 
 @pytest.fixture(scope="module")
@@ -39,7 +43,7 @@ def db_session():
 
 
 def test_full_pipeline_smoke(db_session):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     asset = Asset(
         symbol="btc_mxn",

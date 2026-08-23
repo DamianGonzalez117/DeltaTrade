@@ -1,7 +1,7 @@
 """Modelo de auditoría de alertas emitidas por el sistema."""
 from datetime import datetime
 
-from sqlalchemy import String, DateTime, Text, Integer
+from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trading_system.core.enums import NotificationChannel, NotificationLevel

@@ -6,10 +6,16 @@ del portafolio (posiciones abiertas y snapshots históricos de equity).
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, DateTime, Numeric, ForeignKey, Index
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from trading_system.core.enums import MarketVenue, OrderSide, OrderType, OrderStatus, PositionStatus
+from trading_system.core.enums import (
+    MarketVenue,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionStatus,
+)
 from trading_system.db.base import Base, TimestampMixin
 
 

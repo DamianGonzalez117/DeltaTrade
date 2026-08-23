@@ -169,6 +169,170 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Escanea libros de Bitso y notifica señales por Telegram."""
+    from trading_system.core.enums import TimeFrame
+    from trading_system.features.pipeline import TechnicalFeaturesPipeline
+    from trading_system.notifications.dispatcher import NotificationDispatcher
+    from trading_system.notifications.log_notifier import LogNotifier
+    from trading_system.notifications.telegram import TelegramNotifier
+    from trading_system.services.ingestor import BitsoDataIngestor
+    from trading_system.services.monitor import MarketMonitor, MonitorConfig
+    from trading_system.services.signal_generator import SignalGenerator
+    from trading_system.services.signal_history import SignalHistoryService
+
+    timeframe = TimeFrame(args.timeframe)
+
+    notifiers: list = [LogNotifier()]
+
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        tg = TelegramNotifier(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+        )
+        notifiers.append(tg)
+        logger.info("scan.telegram_enabled", chat_id=settings.telegram_chat_id)
+    else:
+        logger.warning("scan.telegram_not_configured", hint="Configura TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en .env")
+
+    dispatcher = NotificationDispatcher(notifiers)
+
+    ingestor = BitsoDataIngestor(base_url=settings.bitso_rest_url)
+
+    history_service = None
+    if not args.no_history:
+        from trading_system.db.session import SessionLocal
+        history_service = SignalHistoryService(SessionLocal())
+
+    monitor = MarketMonitor(
+        ingestor=ingestor,
+        features_pipeline=TechnicalFeaturesPipeline.create_default(),
+        signal_generator=SignalGenerator(),
+        dispatcher=dispatcher,
+        config=MonitorConfig(
+            books=args.books,
+            timeframe=timeframe,
+            trades_per_book=args.trades,
+            interval_seconds=args.interval,
+            min_confidence=args.min_confidence,
+        ),
+        history_service=history_service,
+    )
+
+    async def _run() -> None:
+        try:
+            if args.once:
+                results = await monitor.scan_once()
+                for book, signal in results.items():
+                    pos = history_service.get_open_position(book) if history_service else None
+                    pos_str = f" [POSITION: qty={pos.quantity}, entry={pos.avg_entry_price}]" if pos else ""
+                    print(f"  {book}: {signal.action.value.upper()} (conf={signal.confidence}, rsi={signal.rsi:.1f}){pos_str}")
+            else:
+                await monitor.run()
+        finally:
+            await ingestor.aclose()
+            for n in notifiers:
+                if hasattr(n, "aclose"):
+                    await n.aclose()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        logger.info("scan.interrupted")
+        monitor.stop()
+
+    return 0
+
+
+def cmd_confirm_buy(args: argparse.Namespace) -> int:
+    """Confirma una compra y abre una posición en la DB."""
+    from trading_system.db.session import SessionLocal
+    from trading_system.services.signal_history import SignalHistoryService
+
+    service = SignalHistoryService(SessionLocal())
+    try:
+        position = service.confirm_buy(
+            book=args.book,
+            quantity=Decimal(args.qty),
+            entry_price=Decimal(args.price),
+        )
+        print(f"✅ Posición abierta: id={position.id} book={args.book} qty={position.quantity} entry={position.avg_entry_price}")
+        logger.info("confirm_buy.success", book=args.book, position_id=position.id)
+        return 0
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+
+
+def cmd_close_position(args: argparse.Namespace) -> int:
+    """Cierra una posición abierta y calcula P&L."""
+    from trading_system.db.session import SessionLocal
+    from trading_system.services.signal_history import SignalHistoryService
+
+    service = SignalHistoryService(SessionLocal())
+    try:
+        position = service.close_position(
+            book=args.book,
+            exit_price=Decimal(args.price),
+        )
+        pnl = position.realized_pnl
+        pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+        print(f"✅ Posición cerrada: id={position.id} book={args.book} exit={Decimal(args.price):,} P&L={pnl_str}")
+        logger.info("close_position.success", book=args.book, position_id=position.id, pnl=str(pnl))
+        return 0
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+
+
+def cmd_positions(args: argparse.Namespace) -> int:
+    """Lista posiciones abiertas."""
+    from trading_system.db.session import SessionLocal
+    from trading_system.services.signal_history import SignalHistoryService
+
+    service = SignalHistoryService(SessionLocal())
+    positions = service.get_all_open_positions()
+
+    if not positions:
+        print("  No hay posiciones abiertas.")
+        return 0
+
+    print(f"  Posiciones abiertas ({len(positions)}):")
+    for pos in positions:
+        print(
+            f"    id={pos.id}  {pos.asset.symbol:12s}  "
+            f"qty={pos.quantity:<14}  entry=${pos.avg_entry_price:,.2f}  "
+            f"opened={pos.opened_at.strftime('%Y-%m-%d %H:%M')}"
+        )
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """Muestra el historial de señales."""
+    from trading_system.db.session import SessionLocal
+    from trading_system.services.signal_history import SignalHistoryService
+
+    service = SignalHistoryService(SessionLocal())
+    signals = service.get_signal_history(
+        book=args.book,
+        limit=args.limit,
+    )
+
+    if not signals:
+        print("  No hay señales registradas.")
+        return 0
+
+    print(f"  Historial de señales ({len(signals)}):")
+    for sig in signals:
+        action_str = sig.action.value if hasattr(sig.action, "value") else str(sig.action)
+        print(
+            f"    {sig.generated_at.strftime('%Y-%m-%d %H:%M')}  "
+            f"{sig.asset.symbol:12s}  {action_str.upper():4s}  "
+            f"conf={sig.confidence:.4f}  model={sig.model_name}"
+        )
+    return 0
+
+
 def cmd_backtest(args: argparse.Namespace) -> int:
     """Ejecuta backtest sobre datos históricos de la DB."""
     import json
@@ -274,6 +438,40 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--venue", default="bitso", choices=["bitso", "gbm"], help="Venue")
     run.add_argument("--dry-run", action="store_true", help="No enviar órdenes reales")
     run.set_defaults(func=cmd_run)
+
+    scan = sub.add_parser("scan", help="Escanea libros de Bitso y notifica señales por Telegram")
+    scan.add_argument(
+        "--books",
+        nargs="+",
+        default=["btc_mxn", "eth_mxn"],
+        help="Libros de Bitso a escanear (ej. btc_mxn eth_mxn)",
+    )
+    scan.add_argument("--timeframe", default="1h", help="Timeframe (1m,5m,15m,1h,4h,1d)")
+    scan.add_argument("--trades", type=int, default=1000, help="Trades a descargar por libro")
+    scan.add_argument("--interval", type=float, default=300.0, help="Segundos entre escaneos")
+    scan.add_argument("--min-confidence", type=float, default=0.65, help="Confianza mínima para notificar")
+    scan.add_argument("--once", action="store_true", help="Solo un escaneo, sin loop")
+    scan.add_argument("--no-history", action="store_true", help="No persistir señales ni filtrar por posiciones")
+    scan.set_defaults(func=cmd_scan)
+
+    confirm_buy = sub.add_parser("confirm-buy", help="Confirma una compra y abre posición")
+    confirm_buy.add_argument("--book", required=True, help="Libro (ej. btc_mxn)")
+    confirm_buy.add_argument("--qty", required=True, help="Cantidad comprada")
+    confirm_buy.add_argument("--price", required=True, help="Precio de entrada")
+    confirm_buy.set_defaults(func=cmd_confirm_buy)
+
+    close_pos = sub.add_parser("close-position", help="Cierra una posición y calcula P&L")
+    close_pos.add_argument("--book", required=True, help="Libro (ej. btc_mxn)")
+    close_pos.add_argument("--price", required=True, help="Precio de salida")
+    close_pos.set_defaults(func=cmd_close_position)
+
+    positions = sub.add_parser("positions", help="Lista posiciones abiertas")
+    positions.set_defaults(func=cmd_positions)
+
+    history = sub.add_parser("history", help="Muestra historial de señales")
+    history.add_argument("--book", default=None, help="Filtrar por libro")
+    history.add_argument("--limit", type=int, default=20, help="Número máximo de señales")
+    history.set_defaults(func=cmd_history)
 
     backtest = sub.add_parser("backtest", help="Backtest sobre datos históricos")
     backtest.add_argument("--asset-id", type=int, required=True, help="ID del activo")

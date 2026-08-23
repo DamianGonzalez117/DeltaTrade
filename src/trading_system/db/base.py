@@ -5,10 +5,10 @@ Se define una convención de nombres explícita para constraints/índices para
 que Alembic genere migraciones consistentes y para poder referenciar
 constraints por nombre en migraciones futuras (ALTER/DROP) sin adivinar.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import MetaData, DateTime
-from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
+from sqlalchemy import DateTime, MetaData
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -24,7 +24,7 @@ class Base(DeclarativeBase):
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class TimestampMixin:
