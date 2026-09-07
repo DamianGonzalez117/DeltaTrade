@@ -20,6 +20,7 @@ from trading_system.features.indicators.moving_averages import (
     SMACalculator,
 )
 from trading_system.features.indicators.rsi import RSICalculator
+from trading_system.features.indicators.volume import VolumeRatioCalculator
 
 
 class TechnicalFeaturesPipeline:
@@ -53,8 +54,11 @@ class TechnicalFeaturesPipeline:
                 RSICalculator(period=14),
                 MACDCalculator(fast=12, slow=26, signal=9),
                 SMACalculator(period=20),
+                EMACalculator(period=9),
                 EMACalculator(period=12),
                 EMACalculator(period=26),
+                EMACalculator(period=21),
                 ATRCalculator(period=14),
+                VolumeRatioCalculator(period=20),
             ]
         )

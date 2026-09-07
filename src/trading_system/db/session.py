@@ -24,7 +24,13 @@ engine = create_engine(
     future=True,
 )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False,  # app de larga duración: objetos usables tras commit sin reload
+    future=True,
+)
 
 
 @contextmanager

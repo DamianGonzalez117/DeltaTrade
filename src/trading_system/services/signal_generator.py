@@ -1,16 +1,24 @@
 """
-Generador de señales basado en reglas técnicas (RSI + MACD).
+Generador de señales basado en reglas técnicas.
 
-Para el prototipo no se requiere un modelo XGBoost entrenado. Este
-generador usa reglas clásicas de trading:
+Dos reglas de entrada BUY:
 
-  - BUY  cuando RSI < oversold_threshold  Y  MACD diff > 0  (cruce alcista en zona de sobreventa)
-  - SELL cuando RSI > overbought_threshold Y  MACD diff < 0  (cruce bajista en zona de sobrecompra)
+  - Regla clásica (RSI + MACD):
+      BUY cuando RSI < oversold_threshold Y MACD diff > 0
+      (cruce alcista en zona de sobreventa)
+
+  - Regla de crecimiento (EMA + volumen):
+      BUY cuando EMA rápida > EMA lenta Y MACD diff > 0 Y
+      volume_ratio > volume_threshold (tendencia alcista confirmada
+      por volumen inusualmente alto)
+
+  - SELL cuando RSI > overbought_threshold Y MACD diff < 0
   - HOLD en cualquier otro caso
 
-La confianza se calcula según qué tan extremo es el RSI:
-  - RSI en 20/80 → confianza ~0.95
-  - RSI en 30/70 → confianza ~0.75
+La confianza se calcula según qué tan extremo es el disparador
+(RSI para la regla clásica, volume_ratio para la de crecimiento):
+  - extremo → confianza ~0.95
+  - threshold → confianza ~0.60
   - Interpolación lineal entre el threshold y el extremo.
 
 DIP: recibe features como dict plano (mismo formato que TechnicalFeaturesPipeline.extract_latest).
@@ -36,7 +44,7 @@ class RuleSignal:
 
 
 class SignalGenerator:
-    """Genera señales BUY/SELL/HOLD basadas en RSI y MACD."""
+    """Genera señales BUY/SELL/HOLD basadas en RSI, MACD, EMA y volumen."""
 
     def __init__(
         self,
@@ -46,6 +54,8 @@ class SignalGenerator:
         rsi_extreme_high: float = 80.0,
         min_confidence: float = 0.60,
         max_confidence: float = 0.95,
+        volume_threshold: float = 1.5,
+        volume_extreme: float = 4.0,
     ) -> None:
         self._oversold = rsi_oversold
         self._overbought = rsi_overbought
@@ -53,6 +63,8 @@ class SignalGenerator:
         self._extreme_high = rsi_extreme_high
         self._min_conf = min_confidence
         self._max_conf = max_confidence
+        self._vol_threshold = volume_threshold
+        self._vol_extreme = volume_extreme
 
     def generate(self, features: dict[str, float]) -> RuleSignal:
         """Genera una señal a partir de features técnicas."""
@@ -68,6 +80,10 @@ class SignalGenerator:
                 macd_diff=macd_diff,
                 reason=f"RSI sobreventa ({rsi:.1f}) + MACD cruce alcista",
             )
+
+        growth = self._check_ema_volume(features, rsi, macd_diff)
+        if growth is not None:
+            return growth
 
         if rsi > self._overbought and macd_diff < 0:
             confidence = self._calc_confidence_sell(rsi)
@@ -85,6 +101,41 @@ class SignalGenerator:
             rsi=rsi,
             macd_diff=macd_diff,
             reason=f"RSI neutral ({rsi:.1f}), sin cruce MACD decisivo",
+        )
+
+    def _check_ema_volume(
+        self,
+        features: dict[str, float],
+        rsi: float,
+        macd_diff: float,
+    ) -> RuleSignal | None:
+        """Regla de crecimiento: EMA rápida > EMA lenta + MACD alcista + volumen alto."""
+        ema_fast = features.get("ema_9")
+        ema_slow = features.get("ema_21")
+        volume_ratio = features.get("volume_ratio_20")
+
+        if ema_fast is None or ema_slow is None or volume_ratio is None:
+            return None
+
+        if ema_fast <= ema_slow or macd_diff <= 0:
+            return None
+
+        if volume_ratio <= self._vol_threshold:
+            return None
+
+        ratio = (volume_ratio - self._vol_threshold) / (self._vol_extreme - self._vol_threshold)
+        ratio = min(max(ratio, 0.0), 1.0)
+        confidence = self._min_conf + ratio * (self._max_conf - self._min_conf)
+
+        return RuleSignal(
+            action=SignalAction.BUY,
+            confidence=Decimal(str(round(confidence, 4))),
+            rsi=rsi,
+            macd_diff=macd_diff,
+            reason=(
+                f"Crecimiento: EMA9>EMA21 ({ema_fast:,.0f} vs {ema_slow:,.0f}) "
+                f"+ MACD alcista + volumen {volume_ratio:.1f}x"
+            ),
         )
 
     def _calc_confidence_buy(self, rsi: float) -> float:

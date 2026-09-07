@@ -201,3 +201,26 @@ class TestCalcUnrealizedPnl:
         pos = service.get_open_position("btc_mxn")
         pnl = service.calc_unrealized_pnl(pos, Decimal(490000))
         assert pnl == Decimal(-100)  # (490000 - 500000) * 0.01
+
+
+class TestTransactionRelease:
+    """Las lecturas deben cerrar su transacción (no dejar locks en apps 24/7)."""
+
+    def test_get_open_position_releases_transaction(self, service, session):
+        service.confirm_buy("btc_mxn", Decimal("0.01"), Decimal(500000))
+        # SELECT abre transacción; el servicio debe cerrarla con commit
+        service.get_open_position("btc_mxn")
+        assert not session.in_transaction()
+
+    def test_get_open_position_unknown_book_releases(self, service, session):
+        service.get_open_position("no_existe_mxn")
+        assert not session.in_transaction()
+
+    def test_get_all_open_positions_releases(self, service, session):
+        service.get_all_open_positions()
+        assert not session.in_transaction()
+
+    def test_get_signal_history_releases(self, service, session):
+        service.save_signal("btc_mxn", _buy_signal())
+        service.get_signal_history(book="btc_mxn")
+        assert not session.in_transaction()

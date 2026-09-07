@@ -1,5 +1,9 @@
 """Notifier para Telegram Bot API.
 
+Envía con ``parse_mode=HTML`` y escape completo: el Markdown legacy de
+Telegram rompe con los ``_`` de los nombres de libros (btc_mxn) y
+responde 400 silenciosamente.
+
 DIP: ``httpx.AsyncClient`` se inyecta para tests con MockTransport.
 """
 import json
@@ -9,6 +13,7 @@ import structlog
 
 from trading_system.core.enums import NotificationChannel
 from trading_system.notifications.base import NotificationMessage, Notifier
+from trading_system.notifications.formatting import to_telegram_html
 
 logger = structlog.get_logger(__name__)
 
@@ -44,12 +49,12 @@ class TelegramNotifier(Notifier):
 
     async def send(self, message: NotificationMessage) -> bool:
         emoji = _LEVEL_EMOJI.get(message.level.value, "ℹ️")
-        text = f"{emoji} *{message.title}*\n{message.body}"
+        text = to_telegram_html(f"{emoji} *{message.title}*\n{message.body}")
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         payload = json.dumps({
             "chat_id": self._chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
         })
         try:
             response = await self._client.post(
@@ -57,7 +62,14 @@ class TelegramNotifier(Notifier):
                 content=payload,
                 headers={"Content-Type": "application/json"},
             )
-            return response.status_code == 200
+            if response.status_code != 200:
+                logger.error(
+                    "telegram.api_error",
+                    status=response.status_code,
+                    detail=response.text[:300],
+                )
+                return False
+            return True
         except httpx.HTTPError as exc:
             logger.error("telegram.send_failed", error=str(exc))
             return False

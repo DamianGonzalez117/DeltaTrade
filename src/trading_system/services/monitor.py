@@ -4,16 +4,22 @@ Monitor de mercado: escanea libros de Bitso y notifica señales por Telegram.
 Flujo por cada libro:
   1. Descarga trades recientes de Bitso (endpoint público, sin auth).
   2. Agrega a velas OHLCV del timeframe configurado.
-  3. Calcula features técnicas (RSI, MACD, SMA, EMA, ATR).
-  4. Genera señal con ``SignalGenerator`` (reglas RSI + MACD).
+  3. Calcula features técnicas (RSI, MACD, SMA, EMA, ATR, volume ratio).
+  4. Genera señal con ``SignalGenerator`` (reglas RSI+MACD y EMA+volumen).
   5. Persiste la señal en ``ai_signals`` (si hay history_service).
-  6. Filtra por posiciones abiertas:
+  6. Monitorea la posición abierta del usuario contra umbrales:
+     - Ganancia >= profit_target_pct → "VENDER, objetivo alcanzado".
+     - Pérdida <= stop_loss_pct → "STOP LOSS".
+     (independiente de la señal técnica; anti-spam por cruce de umbral)
+  7. Filtra señales por posiciones abiertas:
      - BUY: solo notifica si NO hay posición abierta para ese libro.
-     - SELL: solo notifica si HAY posición abierta, incluye P&L.
-  7. Si pasa el filtro → envía notificación a Telegram.
+     - SELL: solo notifica si HAY posición abierta, incluye P&L con precio real.
+  8. Si pasa el filtro → envía notificación a Telegram (BUY enriquecida
+     con precio actual, objetivo de venta sugerido y stats del usuario).
 
 DIP: ``BitsoDataIngestor``, ``TechnicalFeaturesPipeline``, ``SignalGenerator``,
-``NotificationDispatcher``, ``SignalHistoryService`` se inyectan por constructor.
+``NotificationDispatcher``, ``SignalHistoryService``, ``TradeAnalyzer``
+se inyectan por constructor.
 SRP: solo orquesta. No decide tamaños, no ejecuta órdenes.
 """
 from __future__ import annotations
@@ -44,6 +50,8 @@ class MonitorConfig:
     trades_per_book: int = 1000
     interval_seconds: float = 300.0  # 5 min entre escaneos
     min_confidence: float = 0.65  # solo notificar señales con confianza >= este valor
+    profit_target_pct: float = 0.05  # aviso de VENDER cuando ganancia >= 5%
+    stop_loss_pct: float = 0.02  # aviso de STOP LOSS cuando pérdida >= 2%
 
 
 class MarketMonitor:
@@ -58,6 +66,7 @@ class MarketMonitor:
         dispatcher: NotificationDispatcher,
         config: MonitorConfig | None = None,
         history_service=None,
+        trade_analyzer=None,
     ) -> None:
         self._ingestor = ingestor
         self._pipeline = features_pipeline
@@ -65,7 +74,10 @@ class MarketMonitor:
         self._dispatcher = dispatcher
         self._config = config or MonitorConfig()
         self._history = history_service
+        self._analyzer = trade_analyzer
         self._last_signals: dict[str, RuleSignal] = {}
+        self._last_prices: dict[str, float] = {}
+        self._threshold_state: dict[str, str | None] = {}
         self._running = False
 
     async def scan_once(self) -> dict[str, RuleSignal]:
@@ -123,6 +135,8 @@ class MarketMonitor:
 
         features = self._pipeline.extract_latest(ohlcv)
         signal = self._signal_gen.generate(features)
+        last_price = float(ohlcv["close"].iloc[-1])
+        self._last_prices[book] = last_price
 
         logger.info(
             "monitor.signal",
@@ -131,13 +145,16 @@ class MarketMonitor:
             confidence=str(signal.confidence),
             rsi=signal.rsi,
             macd_diff=signal.macd_diff,
+            last_price=last_price,
         )
 
         if self._history is not None:
             self._save_signal(book, signal)
 
+        await self._check_position_thresholds(book, last_price)
+
         if signal.action.value in ("buy", "sell") and float(signal.confidence) >= self._config.min_confidence:
-            await self._maybe_notify(book, signal)
+            await self._maybe_notify(book, signal, last_price)
 
         self._last_signals[book] = signal
         return signal
@@ -149,10 +166,88 @@ class MarketMonitor:
         except (ValueError, RuntimeError, OSError) as exc:
             logger.warning("monitor.save_signal_failed", book=book, error=str(exc))
 
-    async def _maybe_notify(self, book: str, signal: RuleSignal) -> None:
+    async def _check_position_thresholds(self, book: str, last_price: float) -> None:
+        """Monitorea la posición abierta contra objetivos de ganancia y stop loss.
+
+        Anti-spam: 1 notificación por cruce de umbral. El estado se rearma
+        al volver a zona neutral o al cerrar la posición.
+        """
+        if self._history is None:
+            return
+
+        position = self._history.get_open_position(book)
+        if position is None:
+            self._threshold_state[book] = None
+            return
+
+        entry = float(position.avg_entry_price)
+        if entry <= 0:
+            return
+
+        pnl_pct = (last_price - entry) / entry
+
+        if pnl_pct >= self._config.profit_target_pct:
+            if self._threshold_state.get(book) != "profit":
+                self._threshold_state[book] = "profit"
+                await self._notify_profit_target(book, position, last_price, pnl_pct)
+        elif pnl_pct <= -self._config.stop_loss_pct:
+            if self._threshold_state.get(book) != "loss":
+                self._threshold_state[book] = "loss"
+                await self._notify_stop_loss(book, position, last_price, pnl_pct)
+        else:
+            self._threshold_state[book] = None
+
+    async def _notify_profit_target(self, book: str, position, last_price: float, pnl_pct: float) -> None:
+        """Aviso: objetivo de ganancia alcanzado, momento de vender."""
+        pnl = self._calc_pnl(position, last_price)
+        body = (
+            f"🎯 *VENDER — Objetivo alcanzado*\n"
+            f"{book}\n\n"
+            f"Entrada: ${float(position.avg_entry_price):,.2f}\n"
+            f"Actual: ${last_price:,.2f} ({pnl_pct * 100:+.1f}%)\n"
+            f"P&L estimado: ${pnl:,.2f}\n\n"
+            f"Confirma con: `vendí {book} {last_price:,.2f}`"
+        )
+        msg = NotificationMessage(
+            level=NotificationLevel.INFO,
+            title=f"Objetivo alcanzado — {book}",
+            body=body,
+        )
+        await self._dispatcher.dispatch(msg)
+        logger.info("monitor.profit_target_notified", book=book, pnl_pct=round(pnl_pct, 4))
+
+    async def _notify_stop_loss(self, book: str, position, last_price: float, pnl_pct: float) -> None:
+        """Aviso: precio cayó por debajo del stop loss."""
+        pnl = self._calc_pnl(position, last_price)
+        body = (
+            f"⚠️ *STOP LOSS — Pérdida en posición*\n"
+            f"{book}\n\n"
+            f"Entrada: ${float(position.avg_entry_price):,.2f}\n"
+            f"Actual: ${last_price:,.2f} ({pnl_pct * 100:+.1f}%)\n"
+            f"P&L estimado: ${pnl:,.2f}\n\n"
+            f"Evalúa salir: `vendí {book} {last_price:,.2f}`"
+        )
+        msg = NotificationMessage(
+            level=NotificationLevel.WARNING,
+            title=f"Stop Loss — {book}",
+            body=body,
+        )
+        await self._dispatcher.dispatch(msg)
+        logger.info("monitor.stop_loss_notified", book=book, pnl_pct=round(pnl_pct, 4))
+
+    def _calc_pnl(self, position, last_price: float) -> Decimal:
+        """P&L no realizado: usa el history_service si está, si no calcula directo."""
+        if self._history is not None:
+            try:
+                return self._history.calc_unrealized_pnl(position, Decimal(str(last_price)))
+            except (ValueError, RuntimeError, OSError):
+                pass
+        return (Decimal(str(last_price)) - position.avg_entry_price) * position.quantity
+
+    async def _maybe_notify(self, book: str, signal: RuleSignal, last_price: float) -> None:
         """Filtra por posiciones y notifica si corresponde."""
         if self._history is None:
-            await self._notify_signal(book, signal)
+            await self._notify_signal(book, signal, last_price=last_price)
             return
 
         position = self._history.get_open_position(book)
@@ -166,13 +261,14 @@ class MarketMonitor:
             logger.info("monitor.skip_sell_no_position", book=book)
             return
 
-        await self._notify_signal(book, signal, position)
+        await self._notify_signal(book, signal, position, last_price)
 
     async def _notify_signal(
         self,
         book: str,
         signal: RuleSignal,
         position=None,
+        last_price: float | None = None,
     ) -> None:
         """Envía notificación a Telegram para señales BUY/SELL."""
         action_emoji = "🟢" if signal.action.value == "buy" else "🔴"
@@ -185,8 +281,11 @@ class MarketMonitor:
             f"Razón: {signal.reason}"
         )
 
-        if position is not None and signal.action == SignalAction.SELL:
-            current_price = Decimal(str(signal.rsi))
+        if signal.action == SignalAction.BUY:
+            body = self._enrich_buy_body(body, book, last_price)
+
+        if position is not None and signal.action == SignalAction.SELL and last_price is not None:
+            current_price = Decimal(str(last_price))
             pnl = self._history.calc_unrealized_pnl(position, current_price) if self._history else Decimal(0)
             pnl_pct = (pnl / (position.avg_entry_price * position.quantity) * 100) if position.avg_entry_price > 0 else Decimal(0)
             body += (
@@ -203,6 +302,34 @@ class MarketMonitor:
         )
         await self._dispatcher.dispatch(msg)
         logger.info("monitor.notified", book=book, action=signal.action.value)
+
+    def _enrich_buy_body(self, body: str, book: str, last_price: float | None) -> str:
+        """Agrega precio actual, objetivo de venta sugerido y stats al BUY."""
+        if last_price is None:
+            return body
+
+        body += f"\n\n💰 *Precio actual:* ${last_price:,.2f}"
+
+        if self._analyzer is None:
+            return body
+
+        try:
+            target_pct = self._analyzer.suggest_profit_target_pct(
+                book, default_pct=self._config.profit_target_pct * 100
+            )
+            target_price = last_price * (1 + target_pct / 100)
+            body += f"\n🎯 *Objetivo de venta sugerido:* ${target_price:,.2f} (+{target_pct:.1f}%)"
+
+            stats = self._analyzer.get_closed_stats(book)
+            if stats is not None:
+                body += (
+                    f"\n📈 *Tu historial:* {stats.n_trades} trades, "
+                    f"{stats.win_rate * 100:.0f}% win-rate, {stats.avg_profit_pct:+.1f}% promedio"
+                )
+        except (ValueError, RuntimeError, OSError):
+            logger.warning("monitor.analyzer_failed", book=book)
+
+        return body
 
     async def run(self) -> None:
         """Ejecuta el monitor en loop infinito hasta que se llame stop()."""
@@ -232,3 +359,8 @@ class MarketMonitor:
     def last_signals(self) -> dict[str, RuleSignal]:
         """Últimas señales generadas por libro."""
         return dict(self._last_signals)
+
+    @property
+    def last_prices(self) -> dict[str, float]:
+        """Último precio real (último close) por libro."""
+        return dict(self._last_prices)

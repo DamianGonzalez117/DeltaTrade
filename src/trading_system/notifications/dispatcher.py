@@ -43,7 +43,13 @@ class NotificationDispatcher:
                 )
                 results[notifier.channel.value] = False
             else:
-                results[notifier.channel.value] = bool(response)
+                ok = bool(response)
+                if not ok:
+                    logger.warning(
+                        "dispatcher.channel_failed",
+                        channel=notifier.channel.value,
+                    )
+                results[notifier.channel.value] = ok
         return results
 
     async def dispatch_critical_only(self, message: NotificationMessage) -> dict[str, bool]:

@@ -70,6 +70,43 @@ class TestLogNotifier:
 # TelegramNotifier
 # ---------------------------------------------------------------------------
 
+class TestToTelegramHtml:
+    """Marcadores simples → HTML seguro (fix: Markdown rompe con btc_mxn)."""
+
+    def test_bold_marker_converted(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        assert to_telegram_html("*BUY* ahora") == "<b>BUY</b> ahora"
+
+    def test_code_marker_converted(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        assert to_telegram_html("usa `vendí btc_mxn`") == "usa <code>vendí btc_mxn</code>"
+
+    def test_italic_marker_converted(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        assert to_telegram_html("Envía _ayuda_ ahora") == "Envía <i>ayuda</i> ahora"
+
+    def test_underscore_in_book_names_stays_literal(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        out = to_telegram_html("Libro: btc_mxn")
+        assert out == "Libro: btc_mxn"
+        assert "_" in out
+
+    def test_two_books_not_converted_to_italic(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        out = to_telegram_html("btc_mxn eth_mxn")
+        assert out == "btc_mxn eth_mxn"  # _ rodeado de word chars no es italic
+
+    def test_escapes_html_special_chars(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        out = to_telegram_html("P&L < 0 > entra")
+        assert out == "P&amp;L &lt; 0 &gt; entra"
+
+    def test_unbalanced_markers_stay_literal(self):
+        from trading_system.notifications.formatting import to_telegram_html
+        out = to_telegram_html("precio * 5 y `comando")
+        assert out == "precio * 5 y `comando"
+
+
 class TestTelegramNotifier:
     def _make_notifier(self, handler) -> TelegramNotifier:
         transport = httpx.MockTransport(handler)
@@ -110,6 +147,57 @@ class TestTelegramNotifier:
 
         assert seen_body["json"]["chat_id"] == "999"
         assert "Order Filled" in seen_body["json"]["text"]
+
+    async def test_uses_html_parse_mode(self, sample_message):
+        seen_body = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json
+            seen_body["json"] = json.loads(request.content)
+            return httpx.Response(200, json={"ok": True})
+
+        notifier = self._make_notifier(handler)
+        await notifier.send(sample_message)
+        await notifier.aclose()
+
+        assert seen_body["json"]["parse_mode"] == "HTML"
+        assert "<b>" in seen_body["json"]["text"]  # título convertido a bold
+
+    async def test_book_underscore_survives_html_mode(self, sample_message):
+        seen_body = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json
+            seen_body["json"] = json.loads(request.content)
+            return httpx.Response(200, json={"ok": True})
+
+        message = NotificationMessage(
+            level=NotificationLevel.INFO,
+            title="Señal BUY — btc_mxn",
+            body="🟢 *BUY* btc_mxn\nObjetivo: +5%",
+        )
+        notifier = self._make_notifier(handler)
+        result = await notifier.send(message)
+        await notifier.aclose()
+
+        assert result is True
+        assert "btc_mxn" in seen_body["json"]["text"]
+
+    async def test_api_error_is_logged_and_returns_false(self, sample_message):
+        seen_body = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={
+                "ok": False,
+                "description": "Bad Request: can't parse entities",
+            })
+
+        notifier = self._make_notifier(handler)
+        result = await notifier.send(sample_message)
+        await notifier.aclose()
+
+        assert result is False
+        assert seen_body == {}  # handler no captura nada; el log va por structlog
 
     async def test_http_error_does_not_raise_but_returns_false(self, sample_message):
         def handler(request: httpx.Request) -> httpx.Response:

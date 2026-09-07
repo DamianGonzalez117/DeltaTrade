@@ -74,6 +74,8 @@ class TestParser:
         assert args.trades == 1000
         assert args.interval == 300.0
         assert args.min_confidence == 0.65
+        assert args.profit_target == 0.05
+        assert args.stop_loss == 0.02
         assert args.once is False
 
     def test_scan_custom_books(self):
@@ -81,6 +83,12 @@ class TestParser:
         args = parser.parse_args(["scan", "--books", "btc_mxn", "eth_mxn", "sol_mxn"])
         assert len(args.books) == 3
         assert "sol_mxn" in args.books
+
+    def test_scan_custom_thresholds(self):
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--profit-target", "0.03", "--stop-loss", "0.01"])
+        assert args.profit_target == 0.03
+        assert args.stop_loss == 0.01
 
     def test_scan_once_flag(self):
         parser = build_parser()

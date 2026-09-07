@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from trading_system.notifications.dispatcher import NotificationDispatcher
     from trading_system.services.monitor import MarketMonitor
     from trading_system.services.signal_history import SignalHistoryService
+    from trading_system.services.trade_analyzer import TradeAnalyzer
 
 logger = structlog.get_logger(__name__)
 
@@ -45,6 +46,7 @@ class TelegramCommandBot:
         history_service: SignalHistoryService,
         dispatcher: NotificationDispatcher,
         monitor: MarketMonitor | None = None,
+        trade_analyzer: TradeAnalyzer | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._bot_token = bot_token
@@ -52,6 +54,7 @@ class TelegramCommandBot:
         self._history = history_service
         self._dispatcher = dispatcher
         self._monitor = monitor
+        self._analyzer = trade_analyzer
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -157,14 +160,16 @@ class TelegramCommandBot:
 
         try:
             position = self._history.confirm_buy(book, qty, price)
-            await self._send_message(
+            body = (
                 f"✅ *Compra registrada*\n"
                 f"Libro: {book}\n"
                 f"Cantidad: {position.quantity}\n"
                 f"Precio entrada: ${position.avg_entry_price:,.2f}\n"
-                f"ID posición: {position.id}\n\n"
-                f"Te avisaré cuando sea momento de vender."
+                f"ID posición: {position.id}"
             )
+            body += self._target_line(book, float(position.avg_entry_price))
+            body += "\n\nTe avisaré cuando sea momento de vender."
+            await self._send_message(body)
         except ValueError as exc:
             await self._send_message(f"❌ {exc}")
 
@@ -187,15 +192,49 @@ class TelegramCommandBot:
             else:
                 pnl_str = f"-${abs(pnl):,.2f} 🔴"
 
-            await self._send_message(
+            body = (
                 f"✅ *Venta registrada*\n"
                 f"Libro: {book}\n"
                 f"Precio salida: ${Decimal(str(price)):,.2f}\n"
                 f"P&L: {pnl_str}\n"
                 f"ID posición: {position.id}"
             )
+            body += self._stats_line(book)
+            await self._send_message(body)
         except ValueError as exc:
             await self._send_message(f"❌ {exc}")
+
+    def _target_line(self, book: str, entry_price: float) -> str:
+        """Línea con el objetivo de venta sugerido para la posición recién abierta."""
+        if self._analyzer is None:
+            return ""
+        try:
+            target_pct = self._analyzer.suggest_profit_target_pct(book, default_pct=5.0)
+            target_price = entry_price * (1 + target_pct / 100)
+            return (
+                f"\n🎯 *Objetivo de venta:* ${target_price:,.2f} (+{target_pct:.1f}%)"
+            )
+        except (ValueError, RuntimeError, OSError):
+            return ""
+
+    def _stats_line(self, book: str) -> str:
+        """Línea con stats del usuario y próximo objetivo tras cerrar posición."""
+        if self._analyzer is None:
+            return ""
+        try:
+            parts: list[str] = []
+            stats = self._analyzer.get_closed_stats(book)
+            if stats is not None:
+                parts.append(
+                    f"\n📈 *Tu historial:* {stats.n_trades} trades, "
+                    f"{stats.win_rate * 100:.0f}% win-rate, {stats.avg_profit_pct:+.1f}% promedio"
+                )
+            target_pct = self._analyzer.suggest_profit_target_pct(book, default_pct=5.0)
+            parts.append(f"\n🎯 *Próximo objetivo sugerido:* +{target_pct:.1f}%")
+            return "".join(parts)
+        except (ValueError, RuntimeError, OSError):
+            logger.warning("bot.analyzer_failed", book=book)
+            return ""
 
     async def _cmd_positions(self) -> None:
         positions = self._history.get_all_open_positions()
@@ -271,18 +310,26 @@ class TelegramCommandBot:
         await self._send_message(help_text)
 
     async def _send_message(self, text: str) -> None:
+        from trading_system.notifications.formatting import to_telegram_html
+
         url = f"{_API_BASE}{self._bot_token}{_SEND_MESSAGE}"
         payload = json.dumps({
             "chat_id": self._chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
+            "text": to_telegram_html(text),
+            "parse_mode": "HTML",
         })
         try:
-            await self._client.post(
+            response = await self._client.post(
                 url,
                 content=payload,
                 headers={"Content-Type": "application/json"},
             )
+            if response.status_code != 200:
+                logger.error(
+                    "bot.api_error",
+                    status=response.status_code,
+                    detail=response.text[:300],
+                )
         except httpx.HTTPError as exc:
             logger.error("bot.send_failed", error=str(exc))
 

@@ -232,9 +232,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
     ingestor = BitsoDataIngestor(base_url=settings.bitso_rest_url)
 
     history_service = None
+    trade_analyzer = None
     if not args.no_history:
         from trading_system.db.session import SessionLocal
         history_service = SignalHistoryService(SessionLocal())
+        from trading_system.services.trade_analyzer import TradeAnalyzer
+        trade_analyzer = TradeAnalyzer(SessionLocal())
 
     monitor = MarketMonitor(
         ingestor=ingestor,
@@ -247,8 +250,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
             trades_per_book=args.trades,
             interval_seconds=args.interval,
             min_confidence=args.min_confidence,
+            profit_target_pct=args.profit_target,
+            stop_loss_pct=args.stop_loss,
         ),
         history_service=history_service,
+        trade_analyzer=trade_analyzer,
     )
 
     async def _run() -> None:
@@ -270,6 +276,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     history_service=history_service,
                     dispatcher=dispatcher,
                     monitor=monitor,
+                    trade_analyzer=trade_analyzer,
                 )
 
                 scan_task = _aio.create_task(monitor.run())
@@ -505,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--trades", type=int, default=1000, help="Trades a descargar por libro")
     scan.add_argument("--interval", type=float, default=300.0, help="Segundos entre escaneos")
     scan.add_argument("--min-confidence", type=float, default=0.65, help="Confianza mínima para notificar")
+    scan.add_argument("--profit-target", type=float, default=0.05, help="Aviso de VENDER cuando ganancia >= esta fracción (0.05 = 5%%)")
+    scan.add_argument("--stop-loss", type=float, default=0.02, help="Aviso de STOP LOSS cuando pérdida >= esta fracción (0.02 = 2%%)")
     scan.add_argument("--once", action="store_true", help="Solo un escaneo, sin loop")
     scan.add_argument("--interactive", action="store_true", help="Bot interactivo de Telegram (responde compré/vendí/posiciones)")
     scan.add_argument("--no-history", action="store_true", help="No persistir señales ni filtrar por posiciones")

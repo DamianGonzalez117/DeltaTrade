@@ -108,6 +108,7 @@ class SignalHistoryService:
                 )
             ).scalar_one_or_none()
             if asset is None:
+                self._session.commit()
                 return []
             stmt = (
                 select(AISignal)
@@ -116,7 +117,9 @@ class SignalHistoryService:
                 .limit(limit)
             )
 
-        return list(self._session.execute(stmt).scalars().all())
+        result = list(self._session.execute(stmt).scalars().all())
+        self._session.commit()  # termina la transacción de solo lectura (libera locks)
+        return result
 
     def confirm_buy(
         self,
@@ -190,22 +193,27 @@ class SignalHistoryService:
         ).scalar_one_or_none()
 
         if asset is None:
+            self._session.commit()  # libera la transacción de solo lectura
             return None
 
-        return self._session.execute(
+        result = self._session.execute(
             select(Position).where(
                 Position.asset_id == asset.id,
                 Position.status == PositionStatus.OPEN,
             )
         ).scalar_one_or_none()
+        self._session.commit()  # libera la transacción de solo lectura
+        return result
 
     def get_all_open_positions(self) -> list[Position]:
         """Retorna todas las posiciones abiertas."""
-        return list(
+        result = list(
             self._session.execute(
                 select(Position).where(Position.status == PositionStatus.OPEN)
             ).scalars().all()
         )
+        self._session.commit()  # libera la transacción de solo lectura
+        return result
 
     def calc_unrealized_pnl(
         self,
