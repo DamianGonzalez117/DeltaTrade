@@ -10,6 +10,7 @@ Endpoints usados:
     POST   /v3/orders/
     DELETE /v3/orders/{oid}
     GET    /v3/orders/{oid}
+    GET    /v3/order_trades/{oid}   (fills reales de una orden)
 
 La autenticación se delega a ``BitsoAuth`` (SRP): este conector solo se
 preocupa de construir el request y mapear la respuesta a DTOs.
@@ -30,6 +31,7 @@ logger = structlog.get_logger(__name__)
 _BASE_PATH = "/v3"
 _BALANCE_PATH = f"{_BASE_PATH}/balance/"
 _ORDERS_PATH = f"{_BASE_PATH}/orders/"
+_ORDER_TRADES_PATH = f"{_BASE_PATH}/order_trades/"
 
 
 class BitsoRESTConnector:
@@ -106,15 +108,32 @@ class BitsoRESTConnector:
         symbol: str,
         side: OrderSide,
         order_type: OrderType,
-        quantity: Decimal,
+        quantity: Decimal | None = None,
         price: Decimal | None = None,
+        minor: Decimal | None = None,
     ) -> ExecutionResult:
+        """Coloca una orden. ``quantity`` es el monto en moneda major
+        (cripto); ``minor`` es el monto en moneda quote (MXN), solo válido
+        para órdenes de mercado (ej. "gasta exactamente 500 MXN").
+        Exactamente uno de los dos debe especificarse.
+        """
+        if quantity is not None and minor is not None:
+            raise ValueError("Especifica quantity (major) o minor, no ambos")
+        if quantity is None and minor is None:
+            raise ValueError("Especifica quantity (major) o minor")
+
         order_body: dict[str, str] = {
             "book": symbol,
             "side": str(side.value),
             "type": str(order_type.value),
-            "major": str(quantity),
         }
+        if quantity is not None:
+            order_body["major"] = str(quantity)
+        else:
+            if order_type == OrderType.LIMIT:
+                raise ValueError("minor no está soportado para órdenes limit")
+            order_body["minor"] = str(minor)
+
         if order_type == OrderType.LIMIT:
             if price is None:
                 raise ValueError("price es obligatorio para órdenes limit")
@@ -154,3 +173,16 @@ class BitsoRESTConnector:
             average_price=None,
             raw_response=data,
         )
+
+    async def get_order_trades(self, external_order_id: str) -> list[dict]:
+        """Retorna los trades (fills) reales de una orden.
+
+        Cada trade incluye: ``major``, ``minor``, ``price``, ``fees_amount``,
+        ``fees_currency``, ``side``, ``tid``. Los montos llegan con signo
+        desde la perspectiva de la cartera (lo que pagas es negativo), por
+        lo que el consumidor debe usar valores absolutos al agregar.
+        """
+        path = f"{_ORDER_TRADES_PATH}{external_order_id}"
+        data = await self._request("GET", path)
+        payload = data["payload"]
+        return payload if isinstance(payload, list) else []

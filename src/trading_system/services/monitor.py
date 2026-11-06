@@ -14,13 +14,16 @@ Flujo por cada libro:
   7. Filtra señales por posiciones abiertas:
      - BUY: solo notifica si NO hay posición abierta para ese libro.
      - SELL: solo notifica si HAY posición abierta, incluye P&L con precio real.
-  8. Si pasa el filtro → envía notificación a Telegram (BUY enriquecida
-     con precio actual, objetivo de venta sugerido y stats del usuario).
+  8. Si hay ``assistant`` (TradingAssistant): le delega las decisiones de
+     compra/venta (conversación interactiva con confirmación humana y
+     ejecución de órdenes reales) en lugar de notificar plano. Si no hay,
+     envía la notificación a Telegram (BUY enriquecida con precio
+     actual, objetivo de venta sugerido y stats del usuario).
 
 DIP: ``BitsoDataIngestor``, ``TechnicalFeaturesPipeline``, ``SignalGenerator``,
-``NotificationDispatcher``, ``SignalHistoryService``, ``TradeAnalyzer``
-se inyectan por constructor.
-SRP: solo orquesta. No decide tamaños, no ejecuta órdenes.
+``NotificationDispatcher``, ``SignalHistoryService``, ``TradeAnalyzer`` y
+``TradingAssistant`` (opcional) se inyectan por constructor.
+SRP: solo orquesta. No decide tamaños, no ejecuta órdenes, no conversa.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 import httpx
+import pandas as pd
 import structlog
 
 from trading_system.core.enums import NotificationLevel, SignalAction, TimeFrame
@@ -39,6 +43,15 @@ from trading_system.services.ingestor import BitsoDataIngestor
 from trading_system.services.signal_generator import RuleSignal, SignalGenerator
 
 logger = structlog.get_logger(__name__)
+
+_TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+}
 
 
 @dataclass
@@ -67,6 +80,7 @@ class MarketMonitor:
         config: MonitorConfig | None = None,
         history_service=None,
         trade_analyzer=None,
+        assistant=None,
     ) -> None:
         self._ingestor = ingestor
         self._pipeline = features_pipeline
@@ -75,10 +89,30 @@ class MarketMonitor:
         self._config = config or MonitorConfig()
         self._history = history_service
         self._analyzer = trade_analyzer
+        self._assistant = assistant
         self._last_signals: dict[str, RuleSignal] = {}
         self._last_prices: dict[str, float] = {}
+        self._last_ohlcv: dict[str, pd.DataFrame] = {}
         self._threshold_state: dict[str, str | None] = {}
         self._running = False
+
+    def set_assistant(self, assistant) -> None:
+        """Inyecta el asistente interactivo (compra/venta conversacional)."""
+        self._assistant = assistant
+
+    @property
+    def timeframe_minutes(self) -> int:
+        """Minutos por vela del timeframe configurado."""
+        return _TIMEFRAME_MINUTES.get(self._config.timeframe.value, 60)
+
+    @property
+    def config_profit_target_pct(self) -> float:
+        """Objetivo de ganancia fraccional configurado (0.05 = 5%)."""
+        return self._config.profit_target_pct
+
+    def get_last_ohlcv(self, book: str) -> pd.DataFrame | None:
+        """Últimas velas agregadas del libro (para análisis estadístico)."""
+        return self._last_ohlcv.get(book)
 
     async def scan_once(self) -> dict[str, RuleSignal]:
         """Ejecuta un escaneo completo de todos los libros configurados.
@@ -137,6 +171,7 @@ class MarketMonitor:
         signal = self._signal_gen.generate(features)
         last_price = float(ohlcv["close"].iloc[-1])
         self._last_prices[book] = last_price
+        self._last_ohlcv[book] = ohlcv
 
         logger.info(
             "monitor.signal",
@@ -171,6 +206,7 @@ class MarketMonitor:
 
         Anti-spam: 1 notificación por cruce de umbral. El estado se rearma
         al volver a zona neutral o al cerrar la posición.
+        Con asistente: pide confirmación de venta en vez de notificar plano.
         """
         if self._history is None:
             return
@@ -189,11 +225,21 @@ class MarketMonitor:
         if pnl_pct >= self._config.profit_target_pct:
             if self._threshold_state.get(book) != "profit":
                 self._threshold_state[book] = "profit"
-                await self._notify_profit_target(book, position, last_price, pnl_pct)
+                if self._assistant is not None:
+                    await self._assistant.on_sell_recommendation(
+                        book, "profit", last_price, pnl_pct
+                    )
+                else:
+                    await self._notify_profit_target(book, position, last_price, pnl_pct)
         elif pnl_pct <= -self._config.stop_loss_pct:
             if self._threshold_state.get(book) != "loss":
                 self._threshold_state[book] = "loss"
-                await self._notify_stop_loss(book, position, last_price, pnl_pct)
+                if self._assistant is not None:
+                    await self._assistant.on_sell_recommendation(
+                        book, "loss", last_price, pnl_pct
+                    )
+                else:
+                    await self._notify_stop_loss(book, position, last_price, pnl_pct)
         else:
             self._threshold_state[book] = None
 
@@ -245,7 +291,15 @@ class MarketMonitor:
         return (Decimal(str(last_price)) - position.avg_entry_price) * position.quantity
 
     async def _maybe_notify(self, book: str, signal: RuleSignal, last_price: float) -> None:
-        """Filtra por posiciones y notifica si corresponde."""
+        """Filtra por posiciones y notifica si corresponde.
+
+        Con asistente: delega la decisión (BUY → propuesta de compra con
+        monto; SELL → confirmación de venta) y no envía notificación plana.
+        """
+        if self._assistant is not None:
+            await self._assistant_on_signal(book, signal, last_price)
+            return
+
         if self._history is None:
             await self._notify_signal(book, signal, last_price=last_price)
             return
@@ -262,6 +316,30 @@ class MarketMonitor:
             return
 
         await self._notify_signal(book, signal, position, last_price)
+
+    async def _assistant_on_signal(
+        self,
+        book: str,
+        signal: RuleSignal,
+        last_price: float,
+    ) -> None:
+        """Rutea una señal BUY/SELL al asistente interactivo."""
+        if signal.action == SignalAction.BUY:
+            await self._assistant.on_buy_opportunity(book, signal, last_price)
+            return
+
+        if signal.action == SignalAction.SELL:
+            if self._history is None:
+                return
+            position = self._history.get_open_position(book)
+            if position is None:
+                logger.info("monitor.skip_sell_no_position", book=book)
+                return
+            entry = float(position.avg_entry_price)
+            pnl_pct = (last_price - entry) / entry if entry > 0 else 0.0
+            await self._assistant.on_sell_recommendation(
+                book, "signal", last_price, pnl_pct
+            )
 
     async def _notify_signal(
         self,

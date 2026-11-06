@@ -240,6 +240,73 @@ class TestHandleUpdate:
         mock_history.confirm_buy.assert_not_called()
 
 
+class TestAssistantIntegration:
+    """_handle_update enruta respuestas conversacionales al asistente."""
+
+    @pytest.fixture
+    def mock_assistant(self):
+        assistant = MagicMock()
+        assistant.try_handle_reply = AsyncMock(return_value=True)
+        assistant.live_trading = False
+        return assistant
+
+    @pytest.fixture
+    def bot_with_assistant(self, bot, mock_assistant):
+        bot.set_assistant(mock_assistant)
+        return bot
+
+    async def test_reply_consumed_before_command_dispatch(
+        self, bot_with_assistant, mock_assistant, sent_messages
+    ):
+        await bot_with_assistant._handle_update({
+            "update_id": 1,
+            "message": {"chat": {"id": 123456}, "text": "500"},
+        })
+
+        mock_assistant.try_handle_reply.assert_awaited_once_with("500")
+        # el asistente consumió el mensaje: no se despacha como comando
+        # (no hay respuesta "Comando no reconocido" del bot)
+        assert all("no reconocido" not in r.content.decode() for r in sent_messages)
+
+    async def test_reply_not_consumed_falls_back_to_commands(
+        self, bot_with_assistant, mock_assistant, sent_messages
+    ):
+        mock_assistant.try_handle_reply = AsyncMock(return_value=False)
+
+        await bot_with_assistant._handle_update({
+            "update_id": 1,
+            "message": {"chat": {"id": 123456}, "text": "ayuda"},
+        })
+
+        mock_assistant.try_handle_reply.assert_awaited_once_with("ayuda")
+        assert "Comandos" in sent_messages[-1].content.decode()
+
+    async def test_manual_buy_clears_pending_for_book(
+        self, bot_with_assistant, mock_assistant, mock_history
+    ):
+        mock_position = MagicMock()
+        mock_position.id = 1
+        mock_position.quantity = Decimal("0.01")
+        mock_position.avg_entry_price = Decimal(505000)
+        mock_history.confirm_buy.return_value = mock_position
+
+        await bot_with_assistant._dispatch_command("compré btc_mxn 0.01 505000")
+
+        mock_assistant.clear_for_book.assert_called_once_with("btc_mxn")
+
+    async def test_manual_sell_clears_pending_for_book(
+        self, bot_with_assistant, mock_assistant, mock_history
+    ):
+        mock_position = MagicMock()
+        mock_position.id = 1
+        mock_position.realized_pnl = Decimal(150)
+        mock_history.close_position.return_value = mock_position
+
+        await bot_with_assistant._dispatch_command("vendí btc_mxn 520000")
+
+        mock_assistant.clear_for_book.assert_called_once_with("btc_mxn")
+
+
 class TestSendMessageFormat:
     """_send_message usa HTML (fix: Markdown rompe con btc_mxn → 400)."""
 

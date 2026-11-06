@@ -1,21 +1,24 @@
-"""TDD — Tests for BitsoAuth (RED phase).
+"""TDD — Tests for BitsoAuth.
 
-Bitso API v3 authentication:
-  Headers:
-    Authorization: Bitso <api_key>
-    X-Request-Timestamp: <nonce>
-    X-Request-Signature: <hex HMAC-SHA256>
+Bitso API v3 authentication (docs.bitso.com, esquema vigente):
+  UN solo header:
+    Authorization: Bitso <api_key>:<nonce>:<hex HMAC-SHA256>
 
   Signature = HMAC-SHA256(secret, nonce + METHOD + path + body)
+  Nonce v2 (obligatorio desde nov-2025) = timestamp ms (13 dígitos) +
+  salt aleatorio (1-6 dígitos; aquí 6) → 19 dígitos.
 """
 import hashlib
 import hmac
+import re
 import time
 from unittest.mock import patch
 
 import pytest
 
 from trading_system.connectors.bitso.auth import BitsoAuth
+
+_HEADER_RE = re.compile(r"^Bitso (?P<key>[^:]+):(?P<nonce>\d{14,19}):(?P<sig>[0-9a-f]{64})$")
 
 
 def _expected_signature(secret: str, message: str) -> str:
@@ -26,59 +29,75 @@ def _expected_signature(secret: str, message: str) -> str:
     ).hexdigest()
 
 
+def _parse_header(headers: dict[str, str]) -> dict[str, str]:
+    match = _HEADER_RE.match(headers["Authorization"])
+    assert match is not None, f"Header malformado: {headers.get('Authorization')}"
+    return match.groupdict()
+
+
 class TestBitsoAuthHeaderFormat:
-    def test_headers_contain_authorization_with_bitso_prefix(self, api_key, api_secret):
+    def test_single_authorization_header_with_key_nonce_signature(self, api_key, api_secret):
         auth = BitsoAuth(api_key, api_secret)
         headers = auth.build_headers("GET", "/v3/balance/")
-        assert headers["Authorization"] == f"Bitso {api_key}"
 
-    def test_headers_contain_timestamp(self, api_key, api_secret):
+        assert set(headers) == {"Authorization"}
+        parts = _parse_header(headers)
+        assert parts["key"] == api_key
+
+    def test_legacy_split_headers_not_sent(self, api_key, api_secret):
+        """El esquema viejo de 3 headers ya no aplica (causaba 400)."""
         auth = BitsoAuth(api_key, api_secret)
         headers = auth.build_headers("GET", "/v3/balance/")
-        assert "X-Request-Timestamp" in headers
-        nonce = headers["X-Request-Timestamp"]
+
+        assert "X-Request-Timestamp" not in headers
+        assert "X-Request-Signature" not in headers
+
+    def test_nonce_v2_format(self, api_key, api_secret):
+        auth = BitsoAuth(api_key, api_secret)
+        headers = auth.build_headers("GET", "/v3/balance/")
+        nonce = _parse_header(headers)["nonce"]
+
         assert nonce.isdigit()
-        assert len(nonce) >= 10
-
-    def test_headers_contain_signature(self, api_key, api_secret):
-        auth = BitsoAuth(api_key, api_secret)
-        headers = auth.build_headers("GET", "/v3/balance/")
-        sig = headers["X-Request-Signature"]
-        assert len(sig) == 64
-        assert all(c in "0123456789abcdef" for c in sig)
+        assert 14 <= len(nonce) <= 19
+        # los primeros 13 dígitos son un timestamp en ms reciente
+        timestamp_ms = int(nonce[:13])
+        assert abs(timestamp_ms - int(time.time() * 1000)) < 60_000
 
 
 class TestBitsoAuthSignatureCorrectness:
     def test_get_request_no_body(self, api_key, api_secret):
         auth = BitsoAuth(api_key, api_secret)
         headers = auth.build_headers("GET", "/v3/balance/")
-        nonce = headers["X-Request-Timestamp"]
-        message = nonce + "GET" + "/v3/balance/"
-        assert headers["X-Request-Signature"] == _expected_signature(api_secret, message)
+        parts = _parse_header(headers)
+        message = parts["nonce"] + "GET" + "/v3/balance/"
+        assert parts["sig"] == _expected_signature(api_secret, message)
 
     def test_post_request_with_body(self, api_key, api_secret):
         auth = BitsoAuth(api_key, api_secret)
         body = '{"book":"btc_mxn","side":"buy","type":"market","major":"0.01"}'
         headers = auth.build_headers("POST", "/v3/orders/", body)
-        nonce = headers["X-Request-Timestamp"]
-        message = nonce + "POST" + "/v3/orders/" + body
-        assert headers["X-Request-Signature"] == _expected_signature(api_secret, message)
+        parts = _parse_header(headers)
+        message = parts["nonce"] + "POST" + "/v3/orders/" + body
+        assert parts["sig"] == _expected_signature(api_secret, message)
 
     def test_delete_request(self, api_key, api_secret):
         auth = BitsoAuth(api_key, api_secret)
         headers = auth.build_headers("DELETE", "/v3/orders/abc123")
-        nonce = headers["X-Request-Timestamp"]
-        message = nonce + "DELETE" + "/v3/orders/abc123"
-        assert headers["X-Request-Signature"] == _expected_signature(api_secret, message)
+        parts = _parse_header(headers)
+        message = parts["nonce"] + "DELETE" + "/v3/orders/abc123"
+        assert parts["sig"] == _expected_signature(api_secret, message)
 
 
 class TestBitsoAuthMethodCaseInsensitivity:
     def test_method_uppercased_in_signature(self, api_key, api_secret):
         auth = BitsoAuth(api_key, api_secret)
-        with patch("trading_system.connectors.bitso.auth.time.time", return_value=1700000000.0):
+        with patch(
+            "trading_system.connectors.bitso.auth.random.randint",
+            return_value=123456,
+        ):
             headers_lower = auth.build_headers("post", "/v3/orders/", "{}")
             headers_upper = auth.build_headers("POST", "/v3/orders/", "{}")
-        assert headers_lower["X-Request-Signature"] == headers_upper["X-Request-Signature"]
+        assert headers_lower["Authorization"] == headers_upper["Authorization"]
 
 
 class TestBitsoAuthNonceFreshness:
@@ -87,7 +106,10 @@ class TestBitsoAuthNonceFreshness:
         h1 = auth.build_headers("GET", "/v3/balance/")
         time.sleep(0.01)
         h2 = auth.build_headers("GET", "/v3/balance/")
-        assert h1["X-Request-Timestamp"] != h2["X-Request-Timestamp"]
+
+        nonce1 = _parse_header(h1)["nonce"]
+        nonce2 = _parse_header(h2)["nonce"]
+        assert nonce1 != nonce2
 
 
 class TestBitsoAuthEmptyCredentials:

@@ -106,9 +106,12 @@ class TestGetBalances:
         await connector.get_balances()
         await connector.disconnect()
 
-        assert seen_headers["authorization"] == "Bitso MYKEY"
-        assert "x-request-signature" in seen_headers
-        assert "x-request-timestamp" in seen_headers
+        # un solo header: Bitso <key>:<nonce>:<signature>
+        assert seen_headers["authorization"].startswith("Bitso MYKEY:")
+        assert seen_headers["authorization"].count(":") == 2
+        # el esquema viejo de headers separados ya no se envía
+        assert "x-request-signature" not in seen_headers
+        assert "x-request-timestamp" not in seen_headers
 
     async def test_http_400_raises_http_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -148,6 +151,64 @@ class TestPlaceOrder:
         assert seen_body["json"]["type"] == "market"
         assert "major" in seen_body["json"]
         assert "price" not in seen_body["json"]
+
+    async def test_market_buy_with_minor_sends_minor_not_major(self):
+        """Compra por monto en MXN: market + minor (para el asistente)."""
+        seen_body = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_body["json"] = __import__("json").loads(request.content)
+            return httpx.Response(200, json=_place_order_payload())
+
+        connector = _make_connector(handler)
+        await connector.connect()
+        await connector.place_order(
+            symbol="btc_mxn",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            minor=Decimal("1500.50"),
+        )
+        await connector.disconnect()
+
+        assert seen_body["json"]["minor"] == "1500.50"
+        assert "major" not in seen_body["json"]
+        assert seen_body["json"]["type"] == "market"
+
+    async def test_minor_rejected_for_limit_orders(self):
+        connector = _make_connector(lambda r: httpx.Response(200, json=_place_order_payload()))
+        await connector.connect()
+        with pytest.raises(ValueError, match="minor"):
+            await connector.place_order(
+                symbol="btc_mxn",
+                side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                minor=Decimal("1500.50"),
+            )
+        await connector.disconnect()
+
+    async def test_major_and_minor_together_rejected(self):
+        connector = _make_connector(lambda r: httpx.Response(200, json=_place_order_payload()))
+        await connector.connect()
+        with pytest.raises(ValueError, match="no ambos"):
+            await connector.place_order(
+                symbol="btc_mxn",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("0.01"),
+                minor=Decimal("1500.50"),
+            )
+        await connector.disconnect()
+
+    async def test_neither_major_nor_minor_rejected(self):
+        connector = _make_connector(lambda r: httpx.Response(200, json=_place_order_payload()))
+        await connector.connect()
+        with pytest.raises(ValueError, match="Especifica"):
+            await connector.place_order(
+                symbol="btc_mxn",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+            )
+        await connector.disconnect()
 
     async def test_limit_order_includes_price(self):
         seen_body = {}
@@ -270,6 +331,52 @@ class TestGetOrderStatus:
 
         assert seen["method"] == "GET"
         assert seen["path"] == "/v3/orders/order-xyz"
+
+
+class TestGetOrderTrades:
+    async def test_returns_fills_list_from_correct_path(self):
+        seen = {}
+        payload = {
+            "success": True,
+            "payload": [
+                {
+                    "book": "btc_mxn",
+                    "major": "0.00200000",
+                    "minor": "-1000.00",
+                    "price": "500000.00",
+                    "fees_amount": "-0.00000200",
+                    "fees_currency": "btc",
+                    "side": "buy",
+                    "tid": "1",
+                    "oid": "order-abc-123",
+                }
+            ],
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["path"] = request.url.path
+            return httpx.Response(200, json=payload)
+
+        connector = _make_connector(handler)
+        await connector.connect()
+        trades = await connector.get_order_trades("order-abc-123")
+        await connector.disconnect()
+
+        assert seen["method"] == "GET"
+        assert seen["path"] == "/v3/order_trades/order-abc-123"
+        assert len(trades) == 1
+        assert trades[0]["oid"] == "order-abc-123"
+
+    async def test_non_list_payload_returns_empty(self):
+        payload = {"success": True, "payload": {"unexpected": "dict"}}
+
+        connector = _make_connector(lambda r: httpx.Response(200, json=payload))
+        await connector.connect()
+        trades = await connector.get_order_trades("order-abc-123")
+        await connector.disconnect()
+
+        assert trades == []
 
 
 # ---------------------------------------------------------------------------

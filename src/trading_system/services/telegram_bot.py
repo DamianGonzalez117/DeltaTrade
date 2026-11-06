@@ -9,8 +9,13 @@ Comandos soportados:
     estado                           → Muestra últimas señales del scan
     ayuda                            → Lista de comandos
 
-DIP: ``SignalHistoryService`` y ``MarketMonitor`` se inyectan.
-SRP: solo parsea y despacha comandos. No escanea por sí mismo.
+Con un ``TradingAssistant`` inyectado (``set_assistant``), además enruta
+las respuestas conversacionales (montos de compra, sí/no de venta) antes
+de interpretarlas como comandos.
+
+DIP: ``SignalHistoryService``, ``MarketMonitor`` y ``TradingAssistant``
+se inyectan.
+SRP: solo transporta mensajes Telegram↔sistema. No decide ni ejecuta.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ if TYPE_CHECKING:
     from trading_system.services.monitor import MarketMonitor
     from trading_system.services.signal_history import SignalHistoryService
     from trading_system.services.trade_analyzer import TradeAnalyzer
+    from trading_system.services.trading_assistant import TradingAssistant
 
 logger = structlog.get_logger(__name__)
 
@@ -55,6 +61,7 @@ class TelegramCommandBot:
         self._dispatcher = dispatcher
         self._monitor = monitor
         self._analyzer = trade_analyzer
+        self._assistant: TradingAssistant | None = None
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -64,14 +71,27 @@ class TelegramCommandBot:
         self._offset = 0
         self._running = False
 
+    def set_assistant(self, assistant: TradingAssistant) -> None:
+        """Inyecta el asistente de compra/venta conversacional."""
+        self._assistant = assistant
+
+    async def send_message(self, text: str) -> None:
+        """Envía un mensaje al chat (API pública usada por el asistente)."""
+        await self._send_message(text)
+
     async def run(self) -> None:
         """Loop de long polling. Bloquea hasta stop()."""
         self._running = True
         logger.info("bot.starting", chat_id=self._chat_id)
 
-        await self._send_message(
-            "🤖 *Bot activo*\nEnvía _ayuda_ para ver los comandos disponibles."
-        )
+        startup = "🤖 *Bot activo*\nEnvía _ayuda_ para ver los comandos disponibles."
+        if self._assistant is not None:
+            mode = "real" if self._assistant.live_trading else "papel"
+            startup += (
+                f"\n\n🫱 Modo asistente ({mode}): te avisaré de oportunidades "
+                f"de compra y de venta, y tú confirmas cada operación."
+            )
+        await self._send_message(startup)
 
         while self._running:
             try:
@@ -120,6 +140,12 @@ class TelegramCommandBot:
             return
 
         logger.info("bot.received", text=text)
+
+        # Respuestas conversacionales (montos, sí/no) tienen prioridad sobre
+        # los comandos cuando hay una propuesta/confirmación pendiente.
+        if self._assistant is not None and await self._assistant.try_handle_reply(text):
+            return
+
         await self._dispatch_command(text)
 
     async def _dispatch_command(self, text: str) -> None:
@@ -158,6 +184,9 @@ class TelegramCommandBot:
             )
             return
 
+        if self._assistant is not None:
+            self._assistant.clear_for_book(book)
+
         try:
             position = self._history.confirm_buy(book, qty, price)
             body = (
@@ -183,6 +212,9 @@ class TelegramCommandBot:
                 "Ej: `vendí btc_mxn 520000`"
             )
             return
+
+        if self._assistant is not None:
+            self._assistant.clear_for_book(book)
 
         try:
             position = self._history.close_position(book, price)
@@ -295,9 +327,9 @@ class TelegramCommandBot:
         help_text = (
             "🤖 *Comandos disponibles:*\n\n"
             "• `compré btc_mxn 0.01 505000`\n"
-            "  Registra una compra y abre posición\n\n"
+            "  Registra una compra manual y abre posición\n\n"
             "• `vendí btc_mxn 520000`\n"
-            "  Cierra posición y calcula P&L\n\n"
+            "  Cierra posición manualmente y calcula P&L\n\n"
             "• `posiciones`\n"
             "  Lista tus posiciones abiertas\n\n"
             "• `historial [book] [n]`\n"
@@ -305,7 +337,12 @@ class TelegramCommandBot:
             "• `estado`\n"
             "  Muestra últimas señales del scan\n\n"
             "• `ayuda`\n"
-            "  Muestra esta lista"
+            "  Muestra esta lista\n\n"
+            "🫱 *Modo asistente:* cuando detecte una oportunidad te preguntará "
+            "cuánto comprar (responde el monto en MXN, `todo` o `cancelar`). "
+            "Cuando toque vender te pedirá confirmación (`sí`/`no`); si dices "
+            "que no, te mostraré estadísticas de qué pasaría al esperar y "
+            "preguntaré de nuevo (`vender`/`esperar`)."
         )
         await self._send_message(help_text)
 

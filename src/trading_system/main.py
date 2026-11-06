@@ -6,6 +6,8 @@ Comandos:
     python -m trading_system.main train    --asset-id 1 --timeframe 1h --output models/xgb_v1.json
     python -m trading_system.main migrate  [up|down|stamp]
     python -m trading_system.main run      --symbol btc_mxn --venue bitso
+    python -m trading_system.main scan     --interactive          (bot asistente)
+    python -m trading_system.main scan     --interactive --paper  (sin órdenes reales)
 
 Usa argparse (stdlib) para evitar dependencias extra.
 """
@@ -258,6 +260,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     )
 
     async def _run() -> None:
+        trader = None
         try:
             if args.once:
                 results = await monitor.scan_once()
@@ -266,9 +269,37 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     pos_str = f" [POSITION: qty={pos.quantity}, entry={pos.avg_entry_price}]" if pos else ""
                     print(f"  {book}: {signal.action.value.upper()} (conf={signal.confidence}, rsi={signal.rsi:.1f}){pos_str}")
             elif args.interactive and history_service is not None:
+                if not (settings.telegram_bot_token and settings.telegram_chat_id):
+                    logger.error(
+                        "scan.interactive_requires_telegram",
+                        hint="Configura TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en .env",
+                    )
+                    raise SystemExit(1)
+
                 import asyncio as _aio
 
                 from trading_system.services.telegram_bot import TelegramCommandBot
+                from trading_system.services.trading_assistant import TradingAssistant
+
+                if settings.bitso_api_key and settings.bitso_api_secret and not args.paper:
+                    from trading_system.connectors.bitso.auth import BitsoAuth
+                    from trading_system.connectors.bitso.rest import BitsoRESTConnector
+                    from trading_system.services.trader import BitsoTrader
+
+                    connector = BitsoRESTConnector(
+                        auth=BitsoAuth(settings.bitso_api_key, settings.bitso_api_secret),
+                        base_url=settings.bitso_rest_url,
+                    )
+                    trader = BitsoTrader(connector=connector)
+                    logger.info(
+                        "scan.live_trading_enabled",
+                        hint="Las confirmaciones por Telegram ejecutan órdenes REALES en Bitso",
+                    )
+                else:
+                    logger.warning(
+                        "scan.paper_trading",
+                        hint="Sin llaves de Bitso (o --paper): las confirmaciones solo simulan la compra/venta",
+                    )
 
                 tg_bot = TelegramCommandBot(
                     bot_token=settings.telegram_bot_token,
@@ -278,6 +309,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     monitor=monitor,
                     trade_analyzer=trade_analyzer,
                 )
+                assistant = TradingAssistant(
+                    sender=tg_bot,
+                    history_service=history_service,
+                    trader=trader,
+                    trade_analyzer=trade_analyzer,
+                    monitor=monitor,
+                )
+                tg_bot.set_assistant(assistant)
+                monitor.set_assistant(assistant)
 
                 scan_task = _aio.create_task(monitor.run())
                 bot_task = _aio.create_task(tg_bot.run())
@@ -292,6 +332,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
             else:
                 await monitor.run()
         finally:
+            if trader is not None:
+                await trader.aclose()
             await ingestor.aclose()
             for n in notifiers:
                 if hasattr(n, "aclose"):
@@ -516,6 +558,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--stop-loss", type=float, default=0.02, help="Aviso de STOP LOSS cuando pérdida >= esta fracción (0.02 = 2%%)")
     scan.add_argument("--once", action="store_true", help="Solo un escaneo, sin loop")
     scan.add_argument("--interactive", action="store_true", help="Bot interactivo de Telegram (responde compré/vendí/posiciones)")
+    scan.add_argument("--paper", action="store_true", help="Modo papel: no enviar órdenes reales a Bitso aunque haya API keys")
     scan.add_argument("--no-history", action="store_true", help="No persistir señales ni filtrar por posiciones")
     scan.set_defaults(func=cmd_scan)
 
